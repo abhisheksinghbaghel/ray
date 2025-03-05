@@ -4,10 +4,7 @@ client = JobSubmissionClient("http://127.0.0.1:8265")
 
 kick_off_xgboost_benchmark = (
     # Clone ray. If ray is already present, don't clone again.
-    "git clone -b nearora/ray_abs https://github.com/ray-project/ray || true;"
-    "cd ray;"
-    "git checkout releases/2.0.0;"
-    "cd ..;"
+    "git clone -b nearora/ray_abs https://github.com/nearora-msft/ray || true;"
     # Run the benchmark.
     " python ray/release/air_tests/air_benchmarks/workloads/xgboost_benchmark.py"
     " --size 100G"
