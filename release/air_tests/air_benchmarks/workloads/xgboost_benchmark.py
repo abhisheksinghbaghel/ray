@@ -8,6 +8,7 @@ import traceback
 import xgboost as xgb
 
 import ray
+import adlfs
 from ray import data
 from ray.train.xgboost import (
     XGBoostTrainer,
@@ -27,8 +28,8 @@ _EXPERIMENT_PARAMS = {
         "num_workers": 1,
     },
     "100G": {
-        "data": "s3://air-example-data-2/100G-xgboost-data.parquet/",
-        "num_workers": 10,
+        "data": "az://xgboost/*",
+        "num_workers": 3,
     },
 }
 
@@ -73,7 +74,8 @@ def run_and_time_it(f):
 
 @run_and_time_it
 def run_xgboost_training(data_path: str, num_workers: int):
-    ds = data.read_parquet(data_path)
+    ds = data.read_parquet(data_path, adlfs.AzureBlobFileSystem(account_name="azureopendatastorage")
+)
     params = {
         "objective": "binary:logistic",
         "eval_metric": ["logloss", "error"],
