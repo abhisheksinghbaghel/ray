@@ -28,7 +28,7 @@ _EXPERIMENT_PARAMS = {
         "num_workers": 1,
     },
     "100G": {
-        "data": "az://xgboost/*",
+        "data": "az://xgboost/",
         "num_workers": 3,
     },
 }
