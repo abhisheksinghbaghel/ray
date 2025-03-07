@@ -22,13 +22,26 @@ _XGB_MODEL_PATH = "model.json"
 _TRAINING_TIME_THRESHOLD = 1000
 _PREDICTION_TIME_THRESHOLD = 450
 
+# _EXPERIMENT_PARAMS = {
+#     "10G": {
+#         "data": "az://xgboost-10g/",
+#         "num_workers": 1,
+#     },
+#     "100G": {
+#         "data": "az://xgboost/",
+#         "num_workers": 3,
+#     },
+# }
+
+
+# Expermient params for blobfuse
 _EXPERIMENT_PARAMS = {
     "10G": {
-        "data": "s3://air-example-data-2/10G-xgboost-data.parquet/",
+        "data": "local:///data",
         "num_workers": 1,
     },
     "100G": {
-        "data": "az://xgboost/",
+        "data": "local:///data",
         "num_workers": 3,
     },
 }
@@ -74,7 +87,8 @@ def run_and_time_it(f):
 
 @run_and_time_it
 def run_xgboost_training(data_path: str, num_workers: int):
-    ds = ray.data.read_parquet(data_path, filesystem=adlfs.AzureBlobFileSystem(account_name="kuberaysa"))
+    # ds = ray.data.read_parquet(data_path, filesystem=adlfs.AzureBlobFileSystem(account_name="kuberaysa"))
+    ds = ray.data.read_parquet(data_path)
     params = {
         "objective": "binary:logistic",
         "eval_metric": ["logloss", "error"],
@@ -84,6 +98,10 @@ def run_xgboost_training(data_path: str, num_workers: int):
         scaling_config=ScalingConfig(
             num_workers=num_workers,
             resources_per_worker={"CPU": 12},
+        ),
+        # Only enabled for blobfuse
+        run_config=RunConfig(name="test_tuner",
+          storage_path ="~/results"
         ),
         label_column="labels",
         params=params,
@@ -100,7 +118,8 @@ def run_xgboost_training(data_path: str, num_workers: int):
 def run_xgboost_prediction(model_path: str, data_path: str):
     model = xgb.Booster()
     model.load_model(model_path)
-    ds = data.read_parquet(data_path)
+    # ds = data.read_parquet(data_path, filesystem=adlfs.AzureBlobFileSystem(account_name="kuberaysa"))
+    ds = ray.data.read_parquet(data_path)
     ckpt = XGBoostCheckpoint.from_model(booster=model)
     batch_predictor = BatchPredictor.from_checkpoint(ckpt, XGBoostPredictor)
     result = batch_predictor.predict(ds.drop_columns(["labels"]))
