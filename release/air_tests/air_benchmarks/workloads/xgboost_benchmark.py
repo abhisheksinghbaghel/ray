@@ -37,11 +37,11 @@ _PREDICTION_TIME_THRESHOLD = 450
 # Expermient params for blobfuse
 _EXPERIMENT_PARAMS = {
     "10G": {
-        "data": "~/data",
+        "data": "/data",
         "num_workers": 1,
     },
     "100G": {
-        "data": "~/data",
+        "data": "/data",
         "num_workers": 3,
     },
 }
@@ -101,7 +101,7 @@ def run_xgboost_training(data_path: str, num_workers: int):
         ),
         # Only enabled for blobfuse
         run_config=RunConfig(name="test_tuner",
-          storage_path ="~/results"
+          storage_path ="/results"
         ),
         label_column="labels",
         params=params,
