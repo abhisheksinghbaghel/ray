@@ -100,7 +100,7 @@ def run_xgboost_training(data_path: str, num_workers: int):
             resources_per_worker={"CPU": 12},
         ),
         # Only enabled for blobfuse
-        run_config=RunConfig(name="test_tuner",
+        run_config=ray.train.RunConfig(name="test_tuner",
           storage_path ="/results"
         ),
         label_column="labels",
