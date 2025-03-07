@@ -37,11 +37,11 @@ _PREDICTION_TIME_THRESHOLD = 450
 # Expermient params for blobfuse
 _EXPERIMENT_PARAMS = {
     "10G": {
-        "data": "local:///data",
+        "data": "~/data",
         "num_workers": 1,
     },
     "100G": {
-        "data": "local:///data",
+        "data": "~/data",
         "num_workers": 3,
     },
 }
