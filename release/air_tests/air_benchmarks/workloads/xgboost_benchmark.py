@@ -101,7 +101,7 @@ def run_xgboost_training(data_path: str, num_workers: int):
         ),
         # Only enabled for blobfuse
         run_config=RunConfig(
-          storage_path ="/results"
+          local_dir="/results"
         ),
         label_column="labels",
         params=params,
