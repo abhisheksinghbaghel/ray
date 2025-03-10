@@ -42,7 +42,7 @@ _EXPERIMENT_PARAMS = {
     },
     "100G": {
         "data": "/data",
-        "num_workers": 3,
+        "num_workers": 10,
     },
 }
 
