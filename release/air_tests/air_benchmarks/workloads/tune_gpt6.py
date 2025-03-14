@@ -27,23 +27,25 @@ cpus_per_worker = 12
 block_size = 512
 
 def main():
+    print("Initializing Ray")
     ray.init(
-    runtime_env={
-        "pip": [
-            "datasets",
-            "evaluate",
-            # The latest combination accelerate==0.25.0, transformers==4.36.0, deepspeed==0.12.4
-            # has issues with DeepSpeed process group initialization,
-            # and will result in a batch_size validation problem.
-            # TODO(ml-team): get rid of the pins once the issue is fixed.
-            "accelerate==0.18.0",
-            "transformers==4.26.0",
-            "torch>=1.12.0",
-            "deepspeed==0.12.3",
+        runtime_env={
+            "pip": [
+                "datasets",
+                "evaluate",
+                # The latest combination accelerate==0.25.0, transformers==4.36.0, deepspeed==0.12.4
+                # has issues with DeepSpeed process group initialization,
+                # and will result in a batch_size validation problem.
+                # TODO(ml-team): get rid of the pins once the issue is fixed.
+                "accelerate==0.18.0",
+                "transformers==4.26.0",
+                "torch>=1.12.0",
+                "deepspeed==0.12.3",
             ],
         },
     )
 
+    print("Ray initialized, downloading model")
     # Download the model
     _ = run_on_every_node(download_model)
 
@@ -56,6 +58,7 @@ def main():
     "validation": ray.data.from_huggingface(current_dataset["validation"]),
     }
 
+    print("Processing datasets")
     processed_datasets = {
         key: (
             ds.map_batches(split_text, batch_format="pandas")
@@ -69,6 +72,7 @@ def main():
     train_ds_size = processed_datasets["train"].count()
     steps_per_epoch = train_ds_size // (batch_size * num_workers)
 
+    print("Defining trainer")
     trainer = TorchTrainer(
         train_loop_per_worker=train_func,
         train_loop_config={
@@ -82,9 +86,11 @@ def main():
             resources_per_worker={"CPU": cpus_per_worker},
         ),
         datasets=processed_datasets,
-        run_config=RunConfig(storage_path=storage_path),
-        results = trainer.fit()
+        run_config=RunConfig(storage_path=storage_path),        
     )
+
+    print("Running  trainer.fit")
+    results = trainer.fit()
 
 
 def split_text(batch: pd.DataFrame) -> pd.DataFrame:
