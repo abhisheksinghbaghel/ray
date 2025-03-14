@@ -16,10 +16,9 @@ from transformers import (
     default_data_collator,
 )
 from transformers.utils.logging import disable_progress_bar, enable_progress_bar
-from ray import train
-from ray.train.huggingface.transformers import prepare_trainer, RayTrainReportCallback
+from ray.train.huggingface.transformers._transformers_utils import prepare_trainer, RayTrainReportCallback
 from ray.train.torch import TorchTrainer
-from ray.train import RunConfig, ScalingConfig
+from ray.air.config import RunConfig, ScalingConfig
 
 model_name = "EleutherAI/gpt-j-6B"
 use_gpu = False
