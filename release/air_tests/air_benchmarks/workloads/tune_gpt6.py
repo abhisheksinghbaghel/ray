@@ -6,8 +6,8 @@ import subprocess
 import ray.util.scheduling_strategies
 from datasets import load_dataset
 import ray.data
-import evaluate
-import torch
+from rllib import evaluate 
+from ray.train import torch
 from transformers import (
     Trainer,
     TrainingArguments,
