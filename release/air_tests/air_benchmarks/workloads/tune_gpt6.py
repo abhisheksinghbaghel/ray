@@ -285,3 +285,6 @@ def train_func(config):
     trainer.add_callback(RayTrainReportCallback())
     trainer = prepare_trainer(trainer)
     trainer.train()
+
+if __name__ == "__main__":
+    main()
