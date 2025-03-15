@@ -1,84 +1,98 @@
 import numpy as np
 import pandas as pd
 import os
+import socket
 import ray
-import subprocess
-import ray.util.scheduling_strategies
+import torch
+import torch.distributed as dist
 from datasets import load_dataset
 import ray.data
-from ray.rllib import evaluation as evaluate 
-from ray.train import torch
+from ray.train import torch as ray_torch
 from transformers import (
     Trainer,
     TrainingArguments,
-    GPTJForCausalLM,
+    AutoModelForCausalLM,
     AutoTokenizer,
     default_data_collator,
 )
 from transformers.utils.logging import disable_progress_bar, enable_progress_bar
-from ray.train.huggingface.transformers._transformers_utils import prepare_trainer, RayTrainReportCallback
+from ray.train.huggingface.transformers._transformers_utils import (
+    prepare_trainer,
+    RayTrainReportCallback
+)
 from ray.train.torch import TorchTrainer
 from ray.air.config import RunConfig, ScalingConfig
+import ray.train as train
 
-model_name = "EleutherAI/gpt-j-6B"
+# Toggle for CPU or GPU
 use_gpu = False
+
+# Example cluster config
 num_workers = 10
 cpus_per_worker = 12
 block_size = 512
+model_name = "EleutherAI/gpt-neo-125M"
 
 def main():
-    print("Initializing Ray")
+    print("Initializing Ray...")
     ray.init(
+        # Updated versions here:
         runtime_env={
             "pip": [
                 "datasets",
                 "evaluate",
-                # The latest combination accelerate==0.25.0, transformers==4.36.0, deepspeed==0.12.4
-                # has issues with DeepSpeed process group initialization,
-                # and will result in a batch_size validation problem.
-                # TODO(ml-team): get rid of the pins once the issue is fixed.
-                "accelerate==0.18.0",
-                "transformers==4.26.0",
+                "accelerate==1.5.2",
+                "transformers==4.29.2",
                 "torch>=1.12.0",
-                "deepspeed==0.12.3",
+                "deepspeed==0.16.4",
             ],
         },
     )
 
-    print("Ray initialized, downloading model")
-    # Download the model
+    print("Ray initialized, downloading model on each node...")
     _ = run_on_every_node(download_model)
 
-    # Get the dataset
-    print("Loading tiny_shakespeare dataset")
+    print("Loading tiny_shakespeare dataset...")
     current_dataset = load_dataset("tiny_shakespeare")
-    
+
     ray_datasets = {
-    "train": ray.data.from_huggingface(current_dataset["train"]),
-    "validation": ray.data.from_huggingface(current_dataset["validation"]),
+        "train": ray.data.from_huggingface(current_dataset["train"]),
+        "validation": ray.data.from_huggingface(current_dataset["validation"]),
     }
 
-    print("Processing datasets")
+    print("Processing datasets...")
     processed_datasets = {
         key: (
             ds.map_batches(split_text, batch_format="pandas")
-            .map_batches(tokenize, batch_format="pandas")
+              .map_batches(tokenize, batch_format="pandas")
         )
         for key, ds in ray_datasets.items()
     }
 
-    storage_path = "/results" 
+    # Per-device micro-batch size
     batch_size = 16
+    # Example: single grad_accum step
+    gradient_accumulation_steps = 1
+
+    # Steps per epoch
     train_ds_size = processed_datasets["train"].count()
     steps_per_epoch = train_ds_size // (batch_size * num_workers)
+    epochs = 1
 
-    print("Defining trainer")
+    # Pick a free port on the driver; all workers will use it
+    master_port = get_free_port()
+
+    print("Trainer Param epochs={epochs} batch_size={batch_size} steps_per_epoch={steps_per_epoch} use_gpu={use_gpu} gradient_accumulation_steps={gradient_accumulation_steps} master_port={master_port}");
+
     trainer = TorchTrainer(
         train_loop_per_worker=train_func,
         train_loop_config={
-            "epochs": 1,
-            "batch_size": batch_size,  # per device
+            "epochs": epochs,
+            "batch_size": batch_size,
             "steps_per_epoch": steps_per_epoch,
+            "use_gpu": use_gpu,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "master_port": master_port,   # <--- pass the chosen port
         },
         scaling_config=ScalingConfig(
             num_workers=num_workers,
@@ -86,23 +100,21 @@ def main():
             resources_per_worker={"CPU": cpus_per_worker},
         ),
         datasets=processed_datasets,
-        run_config=RunConfig(storage_path=storage_path),        
+        run_config=RunConfig(storage_path="/results"),
     )
 
-    print("Running  trainer.fit")
+    print("Running trainer.fit()...")
     results = trainer.fit()
-
 
 def split_text(batch: pd.DataFrame) -> pd.DataFrame:
     text = list(batch["text"])
     flat_text = "".join(text)
-    split_text = [
+    lines = [
         x.strip()
         for x in flat_text.split("\n")
         if x.strip() and not x.strip()[-1] == ":"
     ]
-    return pd.DataFrame(split_text, columns=["text"])
-
+    return pd.DataFrame(lines, columns=["text"])
 
 def tokenize(batch: pd.DataFrame) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
@@ -117,80 +129,88 @@ def tokenize(batch: pd.DataFrame) -> dict:
     ret["labels"] = ret["input_ids"].copy()
     return dict(ret)
 
-def force_on_node(node_id: str, remote_func_or_actor_class):
+def force_on_node(node_id, func):
+    """Helper to pin a remote func to a specific node."""
     scheduling_strategy = ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-        node_id=node_id, soft=False
+        node_id=node_id,
+        soft=False,
     )
-    options = {"scheduling_strategy": scheduling_strategy}
-    return remote_func_or_actor_class.options(**options)
-
+    return ray.remote(func).options(scheduling_strategy=scheduling_strategy)
 
 def run_on_every_node(remote_func_or_actor_class, **remote_kwargs):
+    """Runs a remote function on every node. Skips GPU node if use_gpu=False."""
     refs = []
     for node in ray.nodes():
-        if node["Alive"] and node["Resources"].get("GPU", None):
-            refs.append(
-                force_on_node(node["NodeID"], remote_func_or_actor_class).remote(
-                    **remote_kwargs
-                )
-            )
+        if node["Alive"] and (not use_gpu or node["Resources"].get("GPU", 0) > 0):
+            remote_on_node = force_on_node(node["NodeID"], remote_func_or_actor_class)
+            refs.append(remote_on_node.remote(**remote_kwargs))
     return ray.get(refs)
 
-
 def download_model():
-    from transformers.utils.hub import TRANSFORMERS_CACHE
+    """Download and cache the model using Hugging Face's transformers library."""
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    print(f"Downloading {model_name} model/tokenizer to cache...")
+    _ = AutoTokenizer.from_pretrained(model_name)
+    _ = AutoModelForCausalLM.from_pretrained(model_name)
+    print(f"Model {model_name} is cached on this node.")
+    return True
 
-    path = os.path.expanduser(
-        os.path.join(TRANSFORMERS_CACHE, "models--EleutherAI--gpt-j-6B")
-    )
-    subprocess.run(["mkdir", "-p", os.path.join(path, "snapshots", "main")])
-    subprocess.run(["mkdir", "-p", os.path.join(path, "refs")])
-    if os.path.exists(os.path.join(path, "refs", "main")):
-        return
-    subprocess.run(
-        [
-            "aws",
-            "s3",
-            "sync",
-            "--no-sign-request",
-            "s3://large-dl-models-mirror/models--EleutherAI--gpt-j-6B/main/",
-            os.path.join(path, "snapshots", "main"),
-        ]
-    )
-    with open(os.path.join(path, "snapshots", "main", "hash"), "r") as f:
-        f_hash = f.read().strip()
-    with open(os.path.join(path, "refs", "main"), "w") as f:
-        f.write(f_hash)
-    os.rename(
-        os.path.join(path, "snapshots", "main"), os.path.join(path, "snapshots", f_hash)
-    )
-
-    
-
+def get_free_port() -> str:
+    """Utility to find a free TCP port for the process group or Master."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("0.0.0.0", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return str(port)
 
 def train_func(config):
-    # Use the actual number of CPUs assigned by Ray
-    os.environ["OMP_NUM_THREADS"] = str(
-        train.get_context().get_trial_resources().bundles[-1].get("CPU", 1)
-    )
-    # Enable tf32 for better performance
-    torch.backends.cuda.matmul.allow_tf32 = True
+    """Per-worker training function with manual process-group init for CPU or GPU."""
+    # Ray Train context
+    ctx = train.get_context()
+    rank = ctx.get_world_rank()
+    world_size = ctx.get_world_size()
+    local_rank = ctx.get_local_rank()
 
-    batch_size = config.get("batch_size", 4)
-    epochs = config.get("epochs", 2)
-    warmup_steps = config.get("warmup_steps", 0)
-    learning_rate = config.get("learning_rate", 0.00002)
-    weight_decay = config.get("weight_decay", 0.01)
-    steps_per_epoch = config.get("steps_per_epoch")
+    # Basic hyperparams
+    use_gpu = config["use_gpu"]
+    gradient_accumulation_steps = config["gradient_accumulation_steps"]
+    batch_size = config["batch_size"]
+    epochs = config["epochs"]
+    steps_per_epoch = config["steps_per_epoch"]
+    master_port = config["master_port"]
 
-    deepspeed = {
-        "fp16": {
-            "enabled": "auto",
-            "initial_scale_power": 8,
-            "hysteresis": 4,
-            "consecutive_hysteresis": True,
-        },
-        "bf16": {"enabled": "auto"},
+    # Manually set environment so Torch/DeepSpeed sees correct info
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = master_port
+
+    # Decide backend
+    backend = "nccl" if use_gpu else "gloo"
+
+    # Initialize torch distributed if not already
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+
+    print(f"[Worker {rank}/{world_size}] epochs={epochs} steps_per_epoch={steps_per_epoch} gradient_accumulation_steps={gradient_accumulation_steps} batch_size={batch_size} local_rank={local_rank}, backend={backend}, GPU={use_gpu}")
+
+    # Enable TF32 if GPU
+    if use_gpu:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Total train batch size = micro_batch_size * gradient_accum_steps * world_size
+    train_batch_size = batch_size * gradient_accumulation_steps * world_size
+    import deepspeed
+    deepspeed.init_distributed()
+
+    # Build explicit DeepSpeed config to avoid mismatch
+    deepspeed_cfg = {
         "optimizer": {
             "type": "AdamW",
             "params": {
@@ -205,64 +225,77 @@ def train_func(config):
                 "device": "cpu",
                 "pin_memory": True,
             },
-            "overlap_comm": True,
             "contiguous_gradients": True,
+        },
+        "gradient_accumulation_steps": "auto",
+        "gradient_clipping": "auto",
+        "train_batch_size": train_batch_size,
+        "train_micro_batch_size_per_gpu": batch_size,
+        "steps_per_print": 10,
+        "wall_clock_breakdown": False,
+    }
+    if use_gpu:
+        deepspeed_cfg["fp16"] = {
+            "enabled": "auto",
+            "initial_scale_power": 8,
+            "hysteresis": 4,
+            "consecutive_hysteresis": True,
+        }
+        deepspeed_cfg["bf16"] = {"enabled": "auto"}
+        deepspeed_cfg["zero_optimization"].update({
+            "overlap_comm": True,
             "reduce_bucket_size": "auto",
             "stage3_prefetch_bucket_size": "auto",
             "stage3_param_persistence_threshold": "auto",
             "gather_16bit_weights_on_model_save": True,
             "round_robin_gradients": True,
-        },
-        "gradient_accumulation_steps": "auto",
-        "gradient_clipping": "auto",
-        "steps_per_print": 10,
-        "train_batch_size": "auto",
-        "train_micro_batch_size_per_gpu": "auto",
-        "wall_clock_breakdown": False,
-    }
+        })
 
-    print("Preparing training arguments")
+    print(f"[Worker {rank}] Training Args Setup (world_size={world_size}, train_batch_size={train_batch_size})")
+
+    disable_progress_bar()
+
+    # Limit to 5 steps for quick test
+    max_steps = min(steps_per_epoch * epochs, 5)  # Adjust as needed for your trial
+    
     training_args = TrainingArguments(
-        "output",
-        logging_steps=1,
+        output_dir="output",
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_steps=max_steps,
         save_strategy="steps",
         save_steps=steps_per_epoch,
-        max_steps=steps_per_epoch * epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=1,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        warmup_steps=warmup_steps,
-        label_names=["input_ids", "attention_mask"],
-        push_to_hub=False,
-        report_to="none",
-        disable_tqdm=True,  # declutter the output a little
-        fp16=True,
+        logging_steps=1,
+        fp16=use_gpu,
+        no_cuda=not use_gpu,
+        log_on_each_node=False,
         gradient_checkpointing=True,
-        deepspeed=deepspeed,
+        deepspeed=deepspeed_cfg,
+        report_to="none",
+        disable_tqdm=True,
+        push_to_hub=False,
     )
-    disable_progress_bar()
+
+    print(training_args)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading model")
-
-    model = GPTJForCausalLM.from_pretrained(model_name, use_cache=False)
+    print(f"[Worker {rank}] Loading model {model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(model_name, use_cache=False)
     model.resize_token_embeddings(len(tokenizer))
-
-    print("Model loaded")
+    print(f"[Worker {rank}] Model loaded")
 
     enable_progress_bar()
-
-    metric = evaluate.load("accuracy")
+    import evaluate as hf_evaluate
+    metric = hf_evaluate.load("accuracy")
 
     train_ds = train.get_dataset_shard("train")
     eval_ds = train.get_dataset_shard("validation")
 
     train_ds_iterable = train_ds.iter_torch_batches(
         batch_size=batch_size,
-        local_shuffle_buffer_size=train.get_context().get_world_size() * batch_size,
+        local_shuffle_buffer_size=batch_size * world_size,
     )
     eval_ds_iterable = eval_ds.iter_torch_batches(batch_size=batch_size)
 
@@ -271,7 +304,7 @@ def train_func(config):
         predictions = np.argmax(logits, axis=-1)
         return metric.compute(predictions=predictions, references=labels)
 
-    trainer = Trainer(
+    hf_trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds_iterable,
@@ -280,11 +313,9 @@ def train_func(config):
         tokenizer=tokenizer,
         data_collator=default_data_collator,
     )
-
-    # Add callback to report checkpoints to Ray Train
-    trainer.add_callback(RayTrainReportCallback())
-    trainer = prepare_trainer(trainer)
-    trainer.train()
+    hf_trainer.add_callback(RayTrainReportCallback())
+    hf_trainer = prepare_trainer(hf_trainer)
+    hf_trainer.train()
 
 if __name__ == "__main__":
     main()
